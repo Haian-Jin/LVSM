@@ -149,55 +149,57 @@ while cur_train_step <= total_train_steps:
 
     export_inter_results = ((cur_train_step-1) == start_train_step) or (cur_train_step % config.training.vis_every == 0)
 
-    skip_optimizer_step = False
-    # Skip optimizer step if loss is NaN or Inf
-    if torch.isnan(ret_dict.loss_metrics.loss) or torch.isinf(ret_dict.loss_metrics.loss):
-        print(f"NaN or Inf loss detected, skip this iteration")
-        skip_optimizer_step = True
-        ret_dict.loss_metrics.loss.data = torch.zeros_like(ret_dict.loss_metrics.loss)
+    if update_grads:
+        skip_optimizer_step = False
+        # Skip optimizer step if loss is NaN or Inf
+        if torch.isnan(ret_dict.loss_metrics.loss) or torch.isinf(ret_dict.loss_metrics.loss):
+            print(f"NaN or Inf loss detected, skip this iteration")
+            skip_optimizer_step = True
+            ret_dict.loss_metrics.loss.data = torch.zeros_like(ret_dict.loss_metrics.loss)
 
-    total_grad_norm = None
-    # Check gradient norm and update optimizer if everything is fine
-    if update_grads and (not skip_optimizer_step):
-        # Unscales the gradients
-        scaler.unscale_(optimizer) 
-        # For all gradients, we safely change the NaN -> 0., inf -> 1e-6, -inf -> 1e-6.
-        with torch.no_grad():
-            for n, p in optimized_param_dict.items():
-                if p.requires_grad and (p.grad is not None):
-                    p.grad.nan_to_num_(nan=0.0, posinf=1e-6, neginf=-1e-6)
-    
-        # visualize the grad norm of each layer of our transformer (FOR DEBUG)
-        if ddp_info.is_main_process and config.training.get("log_grad_norm_details", False):
-            grad_norms = {}  # Dictionary to store norms per layer
-            for name, param in model.named_parameters():
-                if param.grad is not None:  # Some parameters might not have gradients
-                    grad_norms[name] = param.grad.detach().norm().item()  # Detach for safety
-            for layer_name, grad_norm in grad_norms.items():
-                wandb.log({"grad_norm_details/" + layer_name: grad_norm}, step=cur_train_step)
-
-        total_grad_norm = 0.0
-        if config.training.grad_clip_norm > 0:
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(optim_param_list, max_norm=config.training.grad_clip_norm).item()
-
-            if total_grad_norm > config.training.grad_clip_norm * 2.0:
-                print(f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}")
-
-            allowed_gradnorm = config.training.grad_clip_norm * config.training.get("allowed_gradnorm_factor", 5)
-            if total_grad_norm > allowed_gradnorm:
-                skip_optimizer_step = True
-                print(f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step")
-
-            # show grad norm in wandb if it's too large
-            display_grad_norm = total_grad_norm > config.training.grad_clip_norm * 2.0 or total_grad_norm > allowed_gradnorm
-            if display_grad_norm and ddp_info.is_main_process:
-                wandb.log({"grad_norm": total_grad_norm}, step=cur_train_step)
-
+        total_grad_norm = None
+        # Check gradient norm and update optimizer if everything is fine
         if not skip_optimizer_step:
-            scaler.step(optimizer)
-            scaler.update()
-            cur_param_update_step += 1
+            # Unscales the gradients
+            scaler.unscale_(optimizer) 
+            # For all gradients, we safely change the NaN -> 0., inf -> 1e-6, -inf -> 1e-6.
+            with torch.no_grad():
+                for n, p in optimized_param_dict.items():
+                    if p.requires_grad and (p.grad is not None):
+                        p.grad.nan_to_num_(nan=0.0, posinf=1e-6, neginf=-1e-6)
+        
+            # visualize the grad norm of each layer of our transformer (FOR DEBUG)
+            if ddp_info.is_main_process and config.training.get("log_grad_norm_details", False):
+                grad_norms = {}  # Dictionary to store norms per layer
+                for name, param in model.named_parameters():
+                    if param.grad is not None:  # Some parameters might not have gradients
+                        grad_norms[name] = param.grad.detach().norm().item()  # Detach for safety
+                for layer_name, grad_norm in grad_norms.items():
+                    wandb.log({"grad_norm_details/" + layer_name: grad_norm}, step=cur_train_step)
 
+            total_grad_norm = 0.0
+            if config.training.grad_clip_norm > 0:
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(optim_param_list, max_norm=config.training.grad_clip_norm).item()
+
+                if total_grad_norm > config.training.grad_clip_norm * 2.0:
+                    print(f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}")
+
+                allowed_gradnorm = config.training.grad_clip_norm * config.training.get("allowed_gradnorm_factor", 5)
+                if total_grad_norm > allowed_gradnorm:
+                    skip_optimizer_step = True
+                    print(f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step")
+
+                # show grad norm in wandb if it's too large
+                display_grad_norm = total_grad_norm > config.training.grad_clip_norm * 2.0 or total_grad_norm > allowed_gradnorm
+                if display_grad_norm and ddp_info.is_main_process:
+                    wandb.log({"grad_norm": total_grad_norm}, step=cur_train_step)
+
+            # since skip flag may be updated because of grad norm, we check it again
+            if not skip_optimizer_step:
+                scaler.step(optimizer)
+                cur_param_update_step += 1
+
+        scaler.update()
         lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
