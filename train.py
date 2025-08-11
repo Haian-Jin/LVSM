@@ -141,10 +141,10 @@ while cur_train_step <= total_train_steps:
 
     update_grads = (cur_train_step + 1) % grad_accum_steps == 0 or cur_train_step == total_train_steps
     if update_grads:
+        scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
+    else:
         with model.no_sync(): # no sync grads for efficiency
             scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
-    else:
-        scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
     cur_train_step += 1
 
     export_inter_results = ((cur_train_step-1) == start_train_step) or (cur_train_step % config.training.vis_every == 0)
