@@ -110,14 +110,18 @@ class QK_Norm_SelfAttention(nn.Module):
         """
         super().__init__()
         assert dim % head_dim == 0, f"Token dimension {dim} should be divisible by head dimension {head_dim}"
-        
+        assert dim % 2 == 0, f"Input dimension {dim} must be even for splitting I/P"
+
         self.dim = dim
         self.head_dim = head_dim
         self.num_heads = dim // head_dim
         self.attn_dropout = attn_dropout
         self.use_qk_norm = use_qk_norm
+        self.d_half = dim // 2
 
-        self.to_qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        self.to_qkv = nn.Linear(dim, 2 * dim, bias=qkv_bias)
+        self.to_vI = nn.Linear(self.d_half, self.d_half, bias=qkv_bias)
+        self.to_vP = nn.Linear(self.d_half, self.d_half, bias=qkv_bias)
         self.fc = nn.Linear(dim, dim, bias=fc_bias)
         self.attn_fc_dropout = nn.Dropout(fc_dropout)
         
@@ -135,7 +139,10 @@ class QK_Norm_SelfAttention(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+        q, k = self.to_qkv(x).chunk(2, dim=-1)
+        vI = self.to_vI(x[:, :, :self.d_half])
+        vP = self.to_vP(x[:, :, self.d_half:])
+        v = torch.cat((vI, vP), dim=-1)
         
         q, k, v = (rearrange(t, "b l (nh dh) -> b l nh dh", dh=self.head_dim) for t in (q, k, v))
         
@@ -265,7 +272,7 @@ class SubsetAttention(nn.Module):
 
 
 
-class QK_Norm_TransformerBlock(nn.Module):
+class QK_Norm_SelfAttentionBlock(nn.Module):
     """
     Standard transformer block with pre-normalization architecture.
     Reference: https://github.com/facebookresearch/dino/blob/7c446df5b9f45747937fb0d72314eb9f7b66930a/vision_transformer.py#L95-L113
