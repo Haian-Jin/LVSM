@@ -9,7 +9,7 @@ from einops.layers.torch import Rearrange
 from einops import rearrange, repeat
 import traceback
 from utils import camera_utils, data_utils 
-from .transformer import QK_Norm_TransformerBlock, init_weights
+from .transformer import QK_Norm_SelfAttentionBlock, init_weights
 from .loss import LossComputer
 
 
@@ -28,7 +28,7 @@ class Images2LatentScene(nn.Module):
         # Initialize loss computer
         self.loss_computer = LossComputer(config)
 
-    def _create_tokenizer(self, in_channels, patch_size, d_model):
+    def _create_tokenizer(self, in_channels, patch_size, d_half):
         """Helper function to create a tokenizer with given config"""
         tokenizer = nn.Sequential(
             Rearrange(
@@ -38,7 +38,7 @@ class Images2LatentScene(nn.Module):
             ),
             nn.Linear(
                 in_channels * (patch_size**2),
-                d_model,
+                d_half,
                 bias=False,
             ),
         )
@@ -47,26 +47,30 @@ class Images2LatentScene(nn.Module):
         return tokenizer
 
     def _init_tokenizers(self):
-        """Initialize the image and target pose tokenizers, and image token decoder"""
+        """Initialize the image and target pose tokenizers perspectively, and image token decoder"""
+        self.d_model = self.config.model.transformer.d
+        self.d_half = self.d_model // 2
+        assert self.d_model % 2 == 0, "d_model must be even"
+
         # Image tokenizer
         self.image_tokenizer = self._create_tokenizer(
             in_channels = self.config.model.image_tokenizer.in_channels,
             patch_size = self.config.model.image_tokenizer.patch_size,
-            d_model = self.config.model.transformer.d
+            d_half = self.d_half
         )
         
         # Target pose tokenizer
         self.target_pose_tokenizer = self._create_tokenizer(
             in_channels = self.config.model.target_pose_tokenizer.in_channels,
             patch_size = self.config.model.target_pose_tokenizer.patch_size,
-            d_model = self.config.model.transformer.d
+            d_half = self.d_half
         )
         
         # Image token decoder (decode image tokens into pixels)
         self.image_token_decoder = nn.Sequential(
-            nn.LayerNorm(self.config.model.transformer.d, bias=False),
+            nn.LayerNorm(self.d_model, bias=False),
             nn.Linear(
-                self.config.model.transformer.d,
+                self.d_model,
                 (self.config.model.target_pose_tokenizer.patch_size**2) * 3,
                 bias=False,
             ),
@@ -82,7 +86,7 @@ class Images2LatentScene(nn.Module):
 
         # Create transformer blocks
         self.transformer_blocks = [
-            QK_Norm_TransformerBlock(
+            QK_Norm_SelfAttentionBlock(
                 config.d, config.d_head, use_qk_norm=use_qk_norm
             ) for _ in range(config.n_layer)
         ]
@@ -184,9 +188,12 @@ class Images2LatentScene(nn.Module):
             pose_cond = torch.cat([o_cross_d, ray_d], dim=2)
 
         if images is None:
-            return pose_cond
+            b, v, _, h, w = pose_cond.shape
+            image = torch.zeros((b, v, 3, h, w), device=pose_cond.device)
         else:
-            return torch.cat([images * 2.0 - 1.0, pose_cond], dim=2)
+            image = image * 2,0 - 1.0
+        
+        return image, pose_cond
     
     
     def forward(self, data_batch, has_target_image=True):
@@ -194,25 +201,32 @@ class Images2LatentScene(nn.Module):
         input, target = self.process_data(data_batch, has_target_image=has_target_image, target_has_input = self.config.training.target_has_input, compute_rays=True)
 
         # Process input images
-        posed_input_images = self.get_posed_input(
+        input_images, input_pose_cond = self.get_posed_input(
             images=input.image, ray_o=input.ray_o, ray_d=input.ray_d
         )
-        b, v_input, c, h, w = posed_input_images.size()
+        b, v_input, c_img, h_img, w_img = input_images.size()
+        _, _, c_pose, h_pose, w_pose = input_pose_cond.size()
 
-        input_img_tokens = self.image_tokenizer(posed_input_images)  # [b*v, n_patches, d]
+        input_img_tokens = self.image_tokenizer(input_images)  # [b*v, n_patches, d_half]
+        input_pose_tokens = self.target_pose_tokenizer(input_pose_cond) # [b*v, n_patches, d_half]
 
-        _, n_patches, d = input_img_tokens.size()  # [b*v, n_patches, d]
-        input_img_tokens = input_img_tokens.reshape(b, v_input * n_patches, d)  # [b, v*n_patches, d]
+        assert input_img_tokens.shape[1] == input_pose_tokens.shape[1], "Input image and pose tokens must have the same number of patches"
+
+        n_patches = input_img_tokens.shape[1]
+        input_combined_tokens = torch.cat((input_img_tokens, input_pose_tokens), dim=-1)  # [b*v, n_patches, d] 
+        input_combined_tokens = input_combined_tokens.reshape(b, v_input * n_patches, self.d_model)
         
      
-        target_pose_cond= self.get_posed_input(ray_o=target.ray_o, ray_d=target.ray_d)
+        target_images, target_pose_cond= self.get_posed_input(ray_o=target.ray_o, ray_d=target.ray_d)
+        b, v_target, _, h, w = target_pose_cond.size()
 
-        b, v_target, c, h, w = target_pose_cond.size()
-        target_pose_tokens = self.target_pose_tokenizer(target_pose_cond) # [b*v, n_patches, d]
+        target_pose_tokens = self.target_pose_tokenizer(target_pose_cond)
+        target_img_tokens = self.image_tokenizer(target_images)
+        target_combined_tokens = torch.cat((target_img_tokens, target_pose_tokens), dim=-1)  # [b*v, n_patches, d]
 
         # Repeat input tokens for each target view
         repeated_input_img_tokens = repeat(
-            input_img_tokens, 'b np d -> (b v_target) np d', 
+            input_combined_tokens, 'b np d -> (b v_target) np d', 
             v_target=v_target, np=n_patches * v_input
         )
 
